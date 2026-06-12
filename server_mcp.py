@@ -125,6 +125,40 @@ def registra_documento(nome_file: str, hash_file: str, nome_materia: str) -> str
         return f"SUCCESSO: Documento {nome_file} creato e collegato a {nome_materia}."
     except Exception as e:
         return f"ERRORE DB: {str(e)}"
+    
+@mcp.tool()
+def inserisci_articolo_agente(titolo: str, contenuto: str, concetti_spiegati: list[str], materia: str) -> str:
+    """Salva nel grafo un articolo generato dall'Agente, collegandolo ai concetti e alla Materia madre."""
+    
+    # Query 1: Crea l'articolo e lo collega SUBITO alla Materia
+    query_articolo = """
+    MERGE (a:Articolo_Blog {nome: $titolo})
+    SET a.contenuto = $contenuto, a.data_creazione = date(), a.autore = 'Agente_AI'
+    WITH a
+    MATCH (m:Materia {nome: $materia})
+    MERGE (a)-[:APPARTIENE_A]->(m)
+    RETURN a.nome
+    """
+    
+    # Query 2: Collega l'articolo ai singoli concetti teorici
+    query_relazione = """
+    MATCH (a:Articolo_Blog {nome: $titolo})
+    MERGE (c:Concetto_Teorico {nome: $concetto}) 
+    MERGE (a)-[r:SPIEGA]->(c) 
+    RETURN type(r)
+    """
+    
+    try:
+        # Eseguiamo la prima query passando anche la materia
+        driver_neo4j.execute_query(query_articolo, parameters_={"titolo": titolo, "contenuto": contenuto, "materia": materia})
+        
+        # Eseguiamo il ciclo per i concetti
+        for concetto in concetti_spiegati:
+            driver_neo4j.execute_query(query_relazione, parameters_={"titolo": titolo, "concetto": concetto})
+            
+        return f"SUCCESSO: Articolo salvato, agganciato a '{materia}' e collegato a {len(concetti_spiegati)} concetti."
+    except Exception as e:
+        return f"ERRORE SALVATAGGIO ARTICOLO: {str(e)}"
 
 if __name__ == "__main__":
     mcp.run()
