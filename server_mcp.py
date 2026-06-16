@@ -260,5 +260,92 @@ def crea_claim(origine_id: str, testo_claim: str, concetto_riferimento: str) -> 
     except Exception as e:
         return f"ERRORE DB CLAIM: {str(e)}"
 
+@mcp.tool()
+def ricerca_ibrida_krag(vettore_query: list[float], top_k: int = 5) -> str:
+    """
+    Esegue una Ricerca Ibrida Multi-Livello in Neo4j.
+    Cerca i testi più simili tramite Vector Index, poi espande la ricerca
+    ai concetti teorici correlati, ai documenti sorgente e alle affermazioni chiave.
+    """
+    
+    # NOTA: Assicurati di aver creato in Neo4j i due indici:
+    # CREATE VECTOR INDEX chunk_vector_index FOR (c:Chunk_Testo) ON (c.vettore) ...
+    # CREATE VECTOR INDEX article_vector_index FOR (a:Articolo_Blog) ON (a.vettore) ...
+    
+    query_ibrida = """
+    CALL {
+      // 1A. Cerca i chunk dei PDF più pertinenti
+      CALL db.index.vector.queryNodes('chunk_vector_index', $top_k, $vettore_query)
+      YIELD node AS seed_node, score
+      RETURN seed_node, score, "Chunk" AS origine
+      
+      UNION
+      
+      // 1B. Cerca tra i vecchi articoli di blog
+      CALL db.index.vector.queryNodes('article_vector_index', $top_k, $vettore_query)
+      YIELD node AS seed_node, score
+      RETURN seed_node, score, "Articolo" AS origine
+    }
+
+    WITH seed_node, score, origine
+    ORDER BY score DESC
+    LIMIT $top_k
+
+    // 2. ESPANSIONE: Naviga verso i concetti teorici (fino a 2 salti)
+    OPTIONAL MATCH (seed_node)-[:APPARTIENE_A|SPIEGA|MENZIONATO_IN]-(concetto:Concetto_Teorico)
+
+    // 3. ESTRAZIONE CLAIMS: Trova le affermazioni collegate
+    OPTIONAL MATCH (claim:Affermazione)-[:RIGUARDA]->(concetto)
+
+    // 4. ESTRAZIONE FONTI: Risale ai PDF
+    OPTIONAL MATCH (seed_node)-[:APPARTIENE_A|SI_BASA_SU]->(doc:Documento)
+
+    RETURN 
+        origine AS tipo,
+        seed_node.nome AS identificativo,
+        COALESCE(seed_node.testo, seed_node.contenuto) AS testo_corpo,
+        score,
+        collect(DISTINCT concetto.nome) AS concetti_chiave,
+        collect(DISTINCT claim.nome) AS tesi_e_claims,
+        collect(DISTINCT doc.nome) AS file_pdf
+    """
+    
+    try:
+        records, _, _ = driver_neo4j.execute_query(
+            query_ibrida, 
+            parameters_={"vettore_query": vettore_query, "top_k": top_k}
+        )
+        
+        if not records:
+            return "Nessun risultato rilevante trovato nel Knowledge Graph."
+            
+        # Formattazione per l'LLM (Planner/Writer)
+        risultato = "==================================================================\n"
+        risultato += "PACCHETTO DI CONTESTO K-RAG STRUTTURATO\n"
+        risultato += "==================================================================\n\n"
+        
+        for idx, rec in enumerate(records):
+            tipo = rec['tipo']
+            fonti = ", ".join(rec['file_pdf']) if rec['file_pdf'] else "Nessuna fonte diretta"
+            
+            risultato += f"[{idx+1}] FONTE ({tipo}): {fonti} (Rilevanza: {rec['score']:.2f})\n"
+            risultato += f"ID/Titolo: {rec['identificativo']}\n"
+            
+            if rec['concetti_chiave']:
+                risultato += f"Concetti correlati: {', '.join(rec['concetti_chiave'])}\n"
+            
+            if rec['tesi_e_claims']:
+                risultato += "Affermazioni chiave (Claims):\n"
+                for tesi in rec['tesi_e_claims']:
+                    risultato += f"  - {tesi}\n"
+                    
+            risultato += f"Testo estratto:\n{rec['testo_corpo']}\n"
+            risultato += "-" * 50 + "\n\n"
+            
+        return risultato
+        
+    except Exception as e:
+        return f"ERRORE NELLA RICERCA IBRIDA: {str(e)}"
+
 if __name__ == "__main__":
     mcp.run()
