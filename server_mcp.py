@@ -14,11 +14,8 @@ NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
-# ==========================================
-# DRIVER GLOBALE (La soluzione ai blocchi)
-# ==========================================
+
 # Apriamo la connessione UNA sola volta all'avvio del server.
-# Se la password è sbagliata o il DB è spento, si fermerà qui con un errore chiaro.
 try:
     driver_neo4j = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     driver_neo4j.verify_connectivity()
@@ -30,9 +27,7 @@ except Exception as e:
 MACRO_AMMESSE = ["Materia", "Concetto_Teorico", "Componente_Tecnologico", "Processo_Algoritmo", "Persona", "Articolo_Blog", "Chunk_Testo", "Documento", "Affermazione"]
 RELAZIONI_AMMESSE = ["APPARTIENE_A", "SI_BASA_SU", "È_UN_TIPO_DI", "COMPOSTO_DA", "RISOLVE_USA", "SPIEGA", "MENZIONATO_IN", "SOSTIENE", "RIGUARDA"]
 
-# ==========================================
-# TOOLS (Strumenti reali per il Client/LLM)
-# ==========================================
+
 
 @mcp.tool()
 def crea_nodo(macro_categoria: str, nome_entita: str, micro_categoria: str, descrizione_breve: str) -> str:
@@ -269,8 +264,11 @@ def ricerca_ibrida_krag(vettore_query: list[float], top_k: int = 5) -> str:
     """
     
     # NOTA: Assicurati di aver creato in Neo4j i due indici:
-    # CREATE VECTOR INDEX chunk_vector_index FOR (c:Chunk_Testo) ON (c.vettore) ...
-    # CREATE VECTOR INDEX article_vector_index FOR (a:Articolo_Blog) ON (a.vettore) ...
+    """CREATE VECTOR INDEX chunk_vector_index FOR (c:Chunk_Testo) ON (c.vettore)
+    OPTIONS {indexConfig: {`vector.dimensions`: 3072, `vector.similarity_function`: 'cosine'}};
+
+    CREATE VECTOR INDEX article_vector_index FOR (a:Articolo_Blog) ON (a.vettore)
+    OPTIONS {indexConfig: {`vector.dimensions`: 3072, `vector.similarity_function`: 'cosine'}};"""
     
     query_ibrida = """
     CALL {
@@ -292,7 +290,7 @@ def ricerca_ibrida_krag(vettore_query: list[float], top_k: int = 5) -> str:
     LIMIT $top_k
 
     // 2. ESPANSIONE: Naviga verso i concetti teorici (fino a 2 salti)
-    OPTIONAL MATCH (seed_node)-[:APPARTIENE_A|SPIEGA|MENZIONATO_IN]-(concetto:Concetto_Teorico)
+    OPTIONAL MATCH (seed_node)-[:APPARTIENE_A|SPIEGA|MENZIONATO_IN*1..2]-(concetto:Concetto_Teorico)
 
     // 3. ESTRAZIONE CLAIMS: Trova le affermazioni collegate
     OPTIONAL MATCH (claim:Affermazione)-[:RIGUARDA]->(concetto)
