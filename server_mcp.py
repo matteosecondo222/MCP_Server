@@ -125,18 +125,18 @@ def registra_documento(nome_file: str, hash_file: str, nome_materia: str) -> str
 def inserisci_articolo_agente(
     titolo: str, contenuto: str, concetti_spiegati: list[str], 
     materia: str, vettore: list[float], 
-    fonti_documentali: list[str], link_esterni: list[str], relazioni_concetti: list[dict], claims_articolo: list[dict]
+    fonti: list[str], relazioni_concetti: list[dict], claims_articolo: list[dict]
 ) -> str:
     """Salva nel grafo un articolo, il suo embedding, i link web come proprietà e lo collega a concetti e documenti originali."""
     
-    # Query 1: Crea l'articolo con l'array di link e lo collega alla Materia
+    # Query 1: Crea l'articolo con l'array di fonti e lo collega alla Materia
     query_articolo = """
     MERGE (a:Articolo_Blog {nome: $titolo})
     SET a.contenuto = $contenuto, 
         a.data_creazione = date(), 
         a.autore = 'Agente_AI',
         a.vettore = $vettore,
-        a.link_esterni = $link_esterni
+        a.fonti = $fonti
     WITH a
     MATCH (m:Materia {nome: $materia})
     MERGE (a)-[:APPARTIENE_A]->(m)
@@ -149,13 +149,6 @@ def inserisci_articolo_agente(
     MERGE (c:Concetto_Teorico {nome: $concetto}) 
     MERGE (a)-[:SPIEGA]->(c) 
     """
-
-    # Query 3: Collega ai Documenti originali (PDF) citati
-    query_fonti = """
-    MATCH (a:Articolo_Blog {nome: $titolo})
-    MATCH (d:Documento {nome: $documento}) 
-    MERGE (a)-[:SI_BASA_SU]->(d)
-    """
     
     try:
         # Esegue la creazione principale dell'articolo
@@ -163,20 +156,15 @@ def inserisci_articolo_agente(
             query_articolo, 
             parameters_={
                 "titolo": titolo, "contenuto": contenuto, "materia": materia, 
-                "vettore": vettore, "link_esterni": link_esterni
+                "vettore": vettore, "fonti": fonti
             }
         )
         
         # Collega ai concetti
         for concetto in concetti_spiegati:
             driver_neo4j.execute_query(query_concetti, parameters_={"titolo": titolo, "concetto": concetto})
-            
-        # Collega ai documenti usati come fonte
-        for doc in fonti_documentali:
-            # Usiamo MATCH invece di MERGE per il Documento perché il PDF dovrebbe già esistere dall'ingestione
-            driver_neo4j.execute_query(query_fonti, parameters_={"titolo": titolo, "documento": doc})
 
-        # 4. SALVA LE RELAZIONI TRA I CONCETTI (NUOVO BLOCCO)
+        # 3. SALVA LE RELAZIONI TRA I CONCETTI (NUOVO BLOCCO)
         contatore_relazioni = 0
         for rel in relazioni_concetti:
             tipo_rel = rel.get("tipo_relazione")
@@ -199,7 +187,7 @@ def inserisci_articolo_agente(
                 )
                 contatore_relazioni += 1
 
-        # 5. SALVA LE AFFERMAZIONI (CLAIMS) (NUOVO BLOCCO)
+        # 4. SALVA LE AFFERMAZIONI (CLAIMS) (NUOVO BLOCCO)
         query_claim = """
             MERGE (claim:Affermazione {nome: $testo_claim})
             WITH claim
@@ -222,7 +210,7 @@ def inserisci_articolo_agente(
             )
             contatore_claims += 1
             
-        return f"SUCCESSO: Salvato! {len(concetti_spiegati)} concetti, {contatore_relazioni} relazioni, {len(fonti_documentali)} fonti, {contatore_claims} claims."
+        return f"SUCCESSO: Salvato! {len(concetti_spiegati)} concetti, {contatore_relazioni} relazioni, {len(fonti)} fonti, {contatore_claims} claims."
     except Exception as e:
         return f"ERRORE SALVATAGGIO ARTICOLO: {str(e)}"
     
@@ -344,6 +332,83 @@ def ricerca_ibrida_krag(vettore_query: list[float], top_k: int = 5) -> str:
         
     except Exception as e:
         return f"ERRORE NELLA RICERCA IBRIDA: {str(e)}"
+
+@mcp.tool()
+def ricerca_topic_gap(materia_specifica: str = "") -> str:
+    """
+    Analizza il Knowledge Graph per restituire una panoramica degli articoli scritti.
+    Estrae titoli, materie, concetti spiegati e il livello di dettaglio (tramite le affermazioni).
+    Da usare per capire lo stato attuale dei contenuti e suggerire nuovi topic (content gap).
+    """
+    
+    # FIX: Se c'è una materia, usiamo un MATCH rigido per tagliare fuori gli altri articoli.
+    # Se non c'è, usiamo un OPTIONAL MATCH per prenderli tutti.
+    if materia_specifica:
+        blocco_materia = "MATCH (a)-[:APPARTIENE_A]->(m:Materia) WHERE m.nome = $materia"
+    else:
+        blocco_materia = "OPTIONAL MATCH (a)-[:APPARTIENE_A]->(m:Materia)"
+
+    # Costruiamo la query iniettando il blocco corretto
+    query = f"""
+    MATCH (a:Articolo_Blog)
+    {blocco_materia}
+    OPTIONAL MATCH (a)-[:SPIEGA]->(c:Concetto_Teorico)
+    OPTIONAL MATCH (a)-[:SOSTIENE]->(claim:Affermazione)
+    RETURN 
+        a.nome AS titolo,
+        a.data_creazione AS data_creazione,
+        m.nome AS materia,
+        collect(DISTINCT c.nome) AS concetti,
+        count(DISTINCT claim) AS numero_claims,
+        collect(DISTINCT claim.nome)[0..3] AS esempi_claims
+    ORDER BY data_creazione DESC
+    """
+
+    try:
+        parameters = {}
+        if materia_specifica:
+            parameters["materia"] = materia_specifica
+
+        records, _, _ = driver_neo4j.execute_query(query, parameters_=parameters)
+
+        if not records:
+            return "Nessun articolo trovato nel Knowledge Graph. È il momento di scrivere il primo!"
+
+        totale_articoli = len(records)
+        tutti_concetti_trattati = set()
+
+        # Formattazione strutturata per l'LLM
+        risultato = "==================================================================\n"
+        risultato += f"📊 REPORT COPERTURA ARTICOLI (Totale trovati: {totale_articoli})\n"
+        risultato += "==================================================================\n\n"
+
+        for rec in records:
+            titolo = rec["titolo"]
+            materia = rec["materia"] or "Non specificata"
+            concetti = rec["concetti"]
+            num_claims = rec["numero_claims"]
+            claims = rec["esempi_claims"]
+
+            # Raccogliamo i concetti in un set globale per capire l'ecosistema generale
+            tutti_concetti_trattati.update(concetti)
+
+            risultato += f"📝 TITOLO: {titolo}\n"
+            risultato += f"   - Materia: {materia}\n"
+            risultato += f"   - Concetti chiave esplorati ({len(concetti)}): {', '.join(concetti) if concetti else 'Nessuno'}\n"
+            risultato += f"   - Livello di dettaglio: {num_claims} affermazioni (claims) specifiche collegate.\n"
+            if claims:
+                risultato += f"   - Esempi di tesi sostenute: {', '.join(claims)}...\n"
+            risultato += "-" * 50 + "\n"
+
+        # Aggiungiamo un riepilogo finale che fa da "assist" all'LLM
+        risultato += f"\n🧠 MAPPA GLOBALE DEI CONCETTI GIA' ESPLORATI ({len(tutti_concetti_trattati)} concetti unici):\n"
+        risultato += ", ".join(tutti_concetti_trattati) + "\n\n"
+        risultato += "ISTRUZIONI IMPLICITE PER IL PLANNER: Analizza l'elenco qui sopra. Trova i 'punti ciechi' (argomenti o relazioni mancanti tra i concetti) e proponi i prossimi titoli da scrivere."
+
+        return risultato
+
+    except Exception as e:
+        return f"ERRORE DB DURANTE L'ANALISI DELLA COPERTURA: {str(e)}"
 
 if __name__ == "__main__":
     mcp.run()
