@@ -128,6 +128,5 @@ def inserisci_articolo_agente(
         return f"ERRORE SALVATAGGIO ARTICOLO: {str(e)}"
     
 
-
 if __name__ == "__main__":
     mcp.run()
