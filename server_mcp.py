@@ -1,5 +1,7 @@
 from mcp.server.fastmcp import FastMCP
 from neo4j import GraphDatabase
+import chromadb
+from chromadb.utils import embedding_functions
 import os
 from dotenv import load_dotenv
 
@@ -9,11 +11,10 @@ load_dotenv()
 # Inizializza il server MCP
 mcp = FastMCP("Provider-Grafo-Ingegneria")
 
-# Credenziali Neo4j prese dal file .env
+# Connessione a Neo4j
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
-
 
 # Apriamo la connessione UNA sola volta all'avvio del server.
 try:
@@ -22,102 +23,128 @@ try:
 except Exception as e:
     raise RuntimeError(f"Impossibile connettersi a Neo4j all'avvio: {str(e)}")
 
+# Connessione ChromaDB
+try: 
+    chroma_client = chromadb.CloudClient(
+        api_key=os.getenv("CHROMA_API_KEY"),
+        tenant=os.getenv("CHROMA_TENANT"),
+        database=os.getenv("CHROMA_DATABASE")
+    )
+    google_ef = embedding_functions.GoogleGenaiEmbeddingFunction(
+        model_name="gemini-embedding-2"
+    )
+    collection = chroma_client.get_or_create_collection(name="UniAgent_RAG", embedding_function=google_ef)
+except Exception as e:
+    print(f"Impossibile connettersi a chroma cloud. {e}")
+
 
 # --- REGOLE DELL'ONTOLOGIA ---
 MACRO_AMMESSE = ["Materia", "Concetto_Teorico", "Componente_Tecnologico", "Processo_Algoritmo", "Articolo_Blog", "Affermazione"]
 RELAZIONI_AMMESSE = ["APPARTIENE_A", "SI_BASA_SU", "È_UN_TIPO_DI", "COMPOSTO_DA", "RISOLVE", "USA", "SPIEGA", "MENZIONATO_IN", "SOSTIENE", "RIGUARDA"]
     
 @mcp.tool()
-def inserisci_articolo_agente(
-    titolo: str, contenuto: str, concetti_spiegati: list[str], 
-    materia: str, vettore: list[float], 
-    fonti: list[str], relazioni_concetti: list[dict], claims_articolo: list[dict]
+def insert_article(
+    title: str, 
+    content: str, 
+    concepts: list[str], 
+    subject: str, 
+    title_embedding: list[float], 
+    sources: list[str], 
+    concepts_relationships: list[dict], 
+    claims: list[dict]
 ) -> str:
     """Salva nel grafo un articolo, il suo embedding, i link web come proprietà e lo collega a concetti e documenti originali."""
     
     # Query 1: Crea l'articolo con l'array di fonti e lo collega alla Materia
-    query_articolo = """
-    MERGE (a:Articolo_Blog {nome: $titolo})
-    SET a.contenuto = $contenuto, 
-        a.data_creazione = date(), 
-        a.autore = 'Agente_AI',
-        a.vettore = $vettore,
-        a.fonti = $fonti
+    article_query = """
+    MERGE (a:Articolo_Blog {nome: $title})
+    SET a.content = $content, 
+        a.createdAt = date(), 
+        a.author = 'AI_Agent',
+        a.title_embedding = $title_embedding,
+        a.sources = $sources
     WITH a
-    MERGE (m:Materia {nome: $materia})
+    MERGE (m:Materia {nome: $subject})
     MERGE (a)-[:APPARTIENE_A]->(m)
     RETURN a.nome
     """
     
     # Query 2: Collega ai concetti
-    query_concetti = """
-    MATCH (a:Articolo_Blog {nome: $titolo})
-    MERGE (c:Concetto_Teorico {nome: $concetto}) 
+    concept_query = """
+    MATCH (a:Articolo_Blog {nome: $title})
+    MERGE (c:Concetto_Teorico {nome: $concept}) 
     MERGE (a)-[:SPIEGA]->(c) 
     """
     
     try:
         # Esegue la creazione principale dell'articolo
         driver_neo4j.execute_query(
-            query_articolo, 
+            article_query, 
             parameters_={
-                "titolo": titolo, "contenuto": contenuto, "materia": materia, 
-                "vettore": vettore, "fonti": fonti
+                "title": title, 
+                "content": content, 
+                "subject": subject, 
+                "title_embedding": title_embedding, 
+                "sources": sources
             }
         )
         
         # Collega ai concetti
-        for concetto in concetti_spiegati:
-            driver_neo4j.execute_query(query_concetti, parameters_={"titolo": titolo, "concetto": concetto})
+        for concept in concepts:
+            driver_neo4j.execute_query(
+                concept_query, 
+                parameters_={"title": title, "concept": concept}
+            )
             
-
-        # 3. SALVA LE RELAZIONI TRA I CONCETTI (NUOVO BLOCCO)
-        contatore_relazioni = 0
-        for rel in relazioni_concetti:
-            tipo_rel = rel.get("tipo_relazione")
+        # 3. SALVA LE RELAZIONI TRA I CONCETTI
+        relationship_counter = 0
+        for rel in concepts_relationships:
+            # Assumiamo che la chiave sia diventata "relationship_type" nel JSON dell'agente
+            relationship_type = rel.get("relationship_type") 
             
             # Controllo di sicurezza fondamentale
-            if tipo_rel in RELAZIONI_AMMESSE:
-                query_rel_interna = f"""
-                MERGE (c1:Concetto_Teorico {{nome: $origine}})
-                MERGE (c2:Concetto_Teorico {{nome: $destinazione}})
-                MERGE (c1)-[r:{tipo_rel}]->(c2)
-                SET r.dettaglio = $dettaglio
+            if relationship_type in RELAZIONI_AMMESSE:
+                relationship_query = f"""
+                MERGE (c1:Concetto_Teorico {{nome: $origin}})
+                MERGE (c2:Concetto_Teorico {{nome: $destination}})
+                MERGE (c1)-[r:{relationship_type}]->(c2)
+                SET r.detail = $detail
                 """
                 driver_neo4j.execute_query(
-                    query_rel_interna, 
+                    relationship_query, 
                     parameters_={
-                        "origine": rel["origine"], 
-                        "destinazione": rel["destinazione"], 
-                        "dettaglio": rel["dettaglio"]
+                        "origin": rel["origin"],           # Aggiornato in inglese
+                        "destination": rel["destination"], # Aggiornato in inglese
+                        "detail": rel["detail"]            # Aggiornato in inglese
                     }
                 )
-                contatore_relazioni += 1
+                relationship_counter += 1
 
-        # 4. SALVA LE AFFERMAZIONI (CLAIMS) (NUOVO BLOCCO)
-        query_claim = """
-            MERGE (claim:Affermazione {nome: $testo_claim})
+        # 4. SALVA LE AFFERMAZIONI (CLAIMS)
+        claim_query = """
+            MERGE (claim:Affermazione {nome: $claim})
             WITH claim
-            MATCH (a:Articolo_Blog {nome: $titolo})
+            MATCH (a:Articolo_Blog {nome: $title})
             MERGE (a)-[:SOSTIENE]->(claim)
             WITH claim
-            MATCH (c:Concetto_Teorico {nome: $concetto})
+            MATCH (c:Concetto_Teorico {nome: $concept})
             MERGE (claim)-[:RIGUARDA]->(c)
             """
 
-        contatore_claims = 0
-        for claim in claims_articolo:
+        claim_counter = 0
+        for claim_item in claims:
             driver_neo4j.execute_query(
-                query_claim,
+                claim_query,
                 parameters_={
-                    "testo_claim": claim["affermazione"],
-                    "titolo": titolo,
-                    "concetto": claim["concetto_riferimento"]
+                    "claim": claim_item["claim"],
+                    "title": title,
+                    "concept": claim_item["concept_reference"]
                 }
             )
-            contatore_claims += 1
+            claim_counter += 1
             
-        return f"SUCCESSO: Salvato! {len(concetti_spiegati)} concetti, {contatore_relazioni} relazioni, {len(fonti)} fonti, {contatore_claims} claims."
+        return f"SUCCESSO: Salvato! {len(concepts)} concetti, {relationship_counter} relazioni, {len(sources)} fonti, {claim_counter} claims."
+    
     except Exception as e:
         return f"ERRORE SALVATAGGIO ARTICOLO: {str(e)}"
     
@@ -198,6 +225,113 @@ def ricerca_topic_gap(materia_specifica: str = "") -> str:
 
     except Exception as e:
         return f"ERRORE DB DURANTE L'ANALISI DELLA COPERTURA: {str(e)}"
+    
+@mcp.tool()
+def neo4j_search(embedded_title: list[float], top_k: int) -> list[str]:
+    """Ricerca semantica nel Knowledge Graph tramite vettore."""
+    query = """
+    // 1. Punto di ingresso: Ricerca vettoriale sull'indice degli articoli
+    CALL db.index.vector.queryNodes('article_vector_index', $top_k, $embedded_title)
+    YIELD node AS a, score
+    
+    // 2. Filtro di sicurezza (Barriera anti-allucinazione)
+    WHERE score >= $threshold
+    
+    // 3. Estrazione dei Concetti Spiegati
+    OPTIONAL MATCH (a)-[:SPIEGA]->(c:Concetto_Teorico)
+    
+    // 4. Estrazione delle Affermazioni (Claims) relative a quei concetti
+    OPTIONAL MATCH (a)-[:SOSTIENE]->(claim:Affermazione)-[:RIGUARDA]->(c)
+    
+    // 5. Estrazione dei Concetti Correlati (vicini nel grafo)
+    OPTIONAL MATCH (c)-[]-(c_correlato:Concetto_Teorico)
+    WHERE c_correlato <> c AND c_correlato IS NOT NULL
+    
+    // 6. Aggregazione dei risultati
+    RETURN 
+        a.nome AS article,
+        score AS similarita,
+        collect(DISTINCT c.nome) AS theorical_concepts,
+        collect(DISTINCT claim.nome) AS key_claims,
+        collect(DISTINCT c_correlato.nome) AS related_concepts
+    ORDER BY score DESC
+    """
+    result = []
+    try: 
+        records, _, _ = driver_neo4j.execute_query(
+            query, 
+            parameters_={
+                "embedded_title" : embedded_title,
+                "top_k" : top_k,
+                "threshold" : 0.80
+            }
+        )
+
+        if records:
+            for r in records:
+                record = r.data()
+                neo4j_result = f"Trovato articolo: {record['article']}\n"
+                neo4j_result += f"Concetti correlati: {record['theorical_concepts']}\n"
+                neo4j_result += f"Affermazioni Chiave: {record['key_claims']}\n"
+                neo4j_result += f"Concetti Correlati: {record['related_concepts']}\n"
+                neo4j_result += "--------------------------------"
+                result.append(neo4j_result)
+    except Exception as e: 
+        print(f"Errore nella query Neo4j. {e}")
+    
+    print(f"\n\n INFORMAZIONI DAL KNOWLEDGE GRAPH : {result}\n\n")
+    return result
+
+
+@mcp.tool()
+def rag_search(queries: list[str], subject: str, top_k: int = 3) -> dict:
+    """Esegue query sequenziali su ChromaDB, aggirando il bug di batching dell'Embedding di Google."""
+    chunk_unici = {}
+    
+    subject_variations = [
+        subject,
+        subject.lower(),
+        subject.upper(),
+        subject.title(),
+        subject.capitalize()
+    ]
+
+    if not queries:
+        return {"query": "", "results": []}
+    
+    for q in queries:
+        try:
+            rag_results = collection.query(
+                query_texts=[q], 
+                n_results=top_k,
+                where={"subject": {"$in": subject_variations}} 
+            )
+
+            if rag_results and rag_results.get('documents') and rag_results['documents'][0]:
+                documenti = rag_results['documents'][0]
+                ids = rag_results['ids'][0]
+                
+                if rag_results.get('metadatas') and rag_results['metadatas'][0]:
+                    metadati = rag_results['metadatas'][0]
+                else:
+                    metadati = [{}] * len(documenti)
+                
+                for doc_id, doc_text, meta in zip(ids, documenti, metadati):
+                    if doc_id not in chunk_unici:
+                        chunk_unici[doc_id] = {
+                            "source": meta.get("source", "Sconosciuta"),
+                            "content": doc_text,
+                            "id" : doc_id
+                        }
+        except Exception as e:
+            print(f"🔥 Errore ChromaDB sulla query '{q}': {e}")
+            
+    return {
+        "query": " | ".join(queries), 
+        "results": list(chunk_unici.values())
+    }
 
 if __name__ == "__main__":
-    mcp.run()
+    #mcp.run()
+    print("🚀 Avvio del Server MCP su HTTP/SSE (Porta 8000)...")
+    mcp.run(transport="sse")
